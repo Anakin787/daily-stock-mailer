@@ -67,7 +67,7 @@ def _check_config() -> None:
 # MCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("naver-mail-mcp", host=MCP_HOST, port=MCP_PORT)
+mcp = FastMCP("mail-mcp", host=MCP_HOST, port=MCP_PORT)
 
 
 @mcp.tool()
