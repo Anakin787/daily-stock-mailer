@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
+import threading
 import urllib.request
 from typing import Literal, Optional
 
@@ -30,6 +32,55 @@ FROM_NAME        = os.environ.get("FROM_NAME", "US Market Brief").strip()
 MCP_HOST         = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT         = int(os.environ.get("MCP_PORT", "3002"))
 SENDGRID_URL     = "https://api.sendgrid.com/v3/mail/send"
+
+# ---------------------------------------------------------------------------
+# Font paths (resolved once at startup)
+# ---------------------------------------------------------------------------
+
+_FONT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_FONT_REG  = os.path.join(_FONT_DIR, "NanumGothic-Regular.ttf")
+_FONT_BOLD = os.path.join(_FONT_DIR, "NanumGothic-Bold.ttf")
+_fonts_ready = False
+
+
+def _ensure_fonts() -> bool:
+    """Download NanumGothic TTF fonts if not present. Returns True on success."""
+    global _fonts_ready
+    if _fonts_ready:
+        return True
+    os.makedirs(_FONT_DIR, exist_ok=True)
+    urls = {
+        _FONT_REG:  "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
+        _FONT_BOLD: "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Bold.ttf",
+    }
+    for path, url in urls.items():
+        if not os.path.exists(path):
+            print(f"[mail-mcp] Downloading font: {os.path.basename(path)}", file=sys.stderr)
+            try:
+                urllib.request.urlretrieve(url, path)
+            except Exception as e:
+                print(f"[mail-mcp] Font download failed: {e}", file=sys.stderr)
+                return False
+    _fonts_ready = True
+    return True
+
+
+def _warmup_fonts():
+    """Pre-load fonts in background at startup so first PDF is fast."""
+    try:
+        if _ensure_fonts():
+            from fpdf import FPDF
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.add_font("Nanum", "",  _FONT_REG)
+            pdf.add_font("Nanum", "B", _FONT_BOLD)
+            pdf.set_font("Nanum", "", 10)
+            pdf.cell(0, 5, "warmup")
+            pdf.output()
+            print("[mail-mcp] Font warmup complete.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[mail-mcp] Font warmup error (non-fatal): {e}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,85 +102,87 @@ def _check_config() -> None:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-def _ensure_fonts() -> tuple[str, str]:
-    """Download NanumGothic TTF fonts if not present. Returns (regular, bold) paths."""
-    font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-    os.makedirs(font_dir, exist_ok=True)
-    fonts = {
-        "NanumGothic-Regular.ttf": "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
-        "NanumGothic-Bold.ttf":    "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Bold.ttf",
-    }
-    for fname, url in fonts.items():
-        path = os.path.join(font_dir, fname)
-        if not os.path.exists(path):
-            print(f"[mail-mcp] Downloading font: {fname}", file=sys.stderr)
-            urllib.request.urlretrieve(url, path)
-    return (
-        os.path.join(font_dir, "NanumGothic-Regular.ttf"),
-        os.path.join(font_dir, "NanumGothic-Bold.ttf"),
-    )
+def _strip_emoji(text: str) -> str:
+    return re.sub(r'[^\x20-\x7E가-힣㄰-㆏]+', '', text).strip()
 
 
 def _col_widths(n: int) -> list[float]:
-    total = 190.0
-    if n == 2: return [60, 130]
-    if n == 3: return [55, 30, 105]
-    if n == 4: return [55, 35, 30, 70]
-    w = total / n
-    return [w] * n
+    total = 183.0
+    if n == 5: return [50, 30, 30, 30, 43]
+    if n == 4: return [50, 35, 32, 66]
+    if n == 3: return [62, 30, 91]
+    if n == 2: return [65, 118]
+    return [total / n] * n
 
 
 def _html_to_pdf(html_body: str, subject: str) -> bytes:
     from fpdf import FPDF
     from bs4 import BeautifulSoup
 
-    regular, bold = _ensure_fonts()
+    if not _ensure_fonts():
+        raise RuntimeError("Font files unavailable")
 
     soup = BeautifulSoup(html_body, "html.parser")
 
-    NAVY  = (30, 58, 95)
-    DARK  = (34, 34, 34)
-    GRAY  = (136, 136, 136)
-    GREEN = (22, 163, 74)
-    RED   = (220, 38, 38)
-    BG    = (240, 244, 248)
+    NAVY    = (30,  58,  95)
+    DARK    = (34,  34,  34)
+    GRAY    = (130, 130, 130)
+    GREEN   = (22,  163,  74)
+    RED     = (220,  38,  38)
+    BG      = (240, 244, 248)
+    ROW_ALT = (248, 250, 252)
+    WHITE   = (255, 255, 255)
 
-    pdf = FPDF()
+    pdf = FPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_margins(13, 13, 13)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.add_font("Nanum",  "",  regular)
-    pdf.add_font("Nanum",  "B", bold)
+    pdf.add_font("Nanum", "",  _FONT_REG)
+    pdf.add_font("Nanum", "B", _FONT_BOLD)
 
-    # ── 제목 ──
-    title = subject.replace("[시황] ", "")
-    pdf.set_font("Nanum", "B", 16)
-    pdf.set_text_color(*NAVY)
-    pdf.multi_cell(0, 10, title)
-    pdf.set_draw_color(*NAVY)
-    pdf.set_line_width(0.5)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(4)
+    # ── 제목 헤더 (단색 배경 셀로 구현 - rect 없이) ──
+    pdf.set_fill_color(*NAVY)
+    pdf.set_text_color(*WHITE)
+    pdf.set_font("Nanum", "B", 14)
+    title = _strip_emoji(subject.replace("[시황] ", ""))
+    pdf.cell(0, 12, "  " + title, ln=True, fill=True)
+    pdf.set_font("Nanum", "", 8)
+    pdf.set_fill_color(*NAVY)
+    pdf.cell(0, 6, "  US Market Daily Brief", ln=True, fill=True)
+    pdf.ln(5)
 
-    # ── 날짜 부제 ──
-    date_tag = soup.find("p", style=lambda s: s and "color:#888" in s if s else False)
-    if date_tag:
+    # ── 날짜 ──
+    date_text = ""
+    for el in soup.find_all(["div", "p", "small"]):
+        t = el.get_text(strip=True)
+        if ("거래일" in t or "마감" in t) and len(t) < 80:
+            date_text = t
+            break
+    if date_text:
         pdf.set_font("Nanum", "", 9)
         pdf.set_text_color(*GRAY)
-        pdf.cell(0, 6, date_tag.get_text(strip=True), ln=True)
+        pdf.cell(0, 5, _strip_emoji(date_text), ln=True)
         pdf.ln(3)
+
+    ROW_H = 7
 
     # ── 섹션별 테이블 ──
     for h2 in soup.find_all("h2"):
-        sec = h2.get_text(strip=True)
-        pdf.set_font("Nanum", "B", 12)
-        pdf.set_text_color(*NAVY)
+        sec_raw = _strip_emoji(h2.get_text(strip=True))
+
+        # 섹션 헤더: 네이비 왼쪽 셀 + BG 오른쪽 셀
+        pdf.set_font("Nanum", "B", 11)
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(3, 8, "", fill=True)
         pdf.set_fill_color(*BG)
-        pdf.cell(0, 8, sec, ln=True, fill=True)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(180, 8, "  " + sec_raw, ln=True, fill=True)
         pdf.ln(1)
 
         tbl = h2.find_next_sibling("table")
         if not tbl:
-            pdf.ln(3)
+            pdf.ln(2)
             continue
 
         headers = [th.get_text(strip=True) for th in tbl.find_all("th")]
@@ -139,63 +192,122 @@ def _html_to_pdf(html_body: str, subject: str) -> bytes:
             if tds:
                 row = []
                 for td in tds:
-                    style = td.get("style", "")
-                    color = GREEN if "#16a34a" in style else (RED if "#dc2626" in style else None)
-                    row.append((td.get_text(strip=True), color))
+                    s = td.get("style", "")
+                    color = GREEN if "#16a34a" in s else (RED if "#dc2626" in s else None)
+                    bold  = "font-weight" in s
+                    row.append((td.get_text(strip=True), color, bold))
                 rows_raw.append(row)
 
-        if headers:
-            widths = _col_widths(len(headers))
-            pdf.set_font("Nanum", "B", 9)
-            pdf.set_fill_color(*BG)
-            pdf.set_text_color(68, 68, 68)
-            for i, h in enumerate(headers):
-                pdf.cell(widths[i], 7, h, border=1, fill=True)
-            pdf.ln()
+        if not headers:
+            pdf.ln(3)
+            continue
 
-            for row in rows_raw:
-                pdf.set_font("Nanum", "", 9)
-                for i, (txt, col) in enumerate(row):
-                    pdf.set_text_color(*(col if col else DARK))
-                    w = widths[i] if i < len(widths) else widths[-1]
-                    pdf.cell(w, 7, txt, border=1)
+        widths = _col_widths(len(headers))
+
+        # 헤더 행
+        pdf.set_font("Nanum", "B", 8.5)
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(*WHITE)
+        pdf.set_draw_color(200, 210, 225)
+        pdf.set_line_width(0.2)
+        for i, h in enumerate(headers):
+            pdf.cell(widths[i], ROW_H, h, border=1, fill=True, align='C')
+        pdf.ln()
+
+        # 데이터 행 (마지막 컬럼 줄 수에 따라 전체 행 높이 통일)
+        for r_idx, row in enumerate(rows_raw):
+            fill = ROW_ALT if r_idx % 2 == 0 else WHITE
+            y_row = pdf.get_y()
+
+            # 마지막 컬럼 줄 수 계산 (4컬럼 이상 테이블만)
+            num_lines = 1
+            lw = widths[len(row)-1] if len(row)-1 < len(widths) else widths[-1]
+            if len(row) >= 4:
+                pdf.set_font("Nanum", "", 8.5)
+                sw = pdf.get_string_width(row[-1][0])
+                usable = max(1.0, lw - 4)
+                num_lines = max(1, int(sw / usable) + (1 if sw % usable > 0 else 0))
+
+            actual_h = ROW_H * num_lines  # 모든 셀이 이 높이를 공유
+
+            # 마지막 컬럼 제외한 나머지 셀 렌더링
+            needs_wrap = num_lines > 1
+            cols_to_render = row[:-1] if needs_wrap else row
+            for i, (txt, col, is_bold) in enumerate(cols_to_render):
+                pdf.set_fill_color(*fill)
+                pdf.set_text_color(*(col if col else DARK))
+                pdf.set_font("Nanum", "B" if (is_bold or col) else "", 8.5)
+                w = widths[i] if i < len(widths) else widths[-1]
+                is_last = (i == len(row) - 1)
+                align = 'L' if is_last and len(row) >= 4 else 'C'
+                pdf.cell(w, actual_h, txt, border=1, fill=True, align=align)
+
+            # 마지막 컬럼: 줄바꿈 필요 시 multi_cell, 아니면 일반 cell
+            if needs_wrap:
+                last_txt, col, is_bold = row[-1]
+                pdf.set_fill_color(*fill)
+                pdf.set_text_color(*(col if col else DARK))
+                pdf.set_font("Nanum", "B" if (is_bold or col) else "", 8.5)
+                pdf.multi_cell(lw, ROW_H, last_txt, border=1, fill=True, align='L')
+                # multi_cell 후 커서를 다음 행 시작 위치로 강제 이동
+                pdf.set_xy(13, y_row + actual_h)
+            else:
                 pdf.ln()
-            pdf.set_text_color(*DARK)
 
+        pdf.set_text_color(*DARK)
         pdf.ln(4)
 
-    # ── 주요 헤드라인 ──
-    headline_p = soup.find("p", style=lambda s: s and "font-size:14px" in s if s else False)
+    # ── 헤드라인 ──
+    headline_p = soup.find("p", style=lambda s: s and "font-size" in s if s else False)
     if headline_p:
         pdf.set_font("Nanum", "B", 11)
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(3, 8, "", fill=True)
+        pdf.set_fill_color(*BG)
         pdf.set_text_color(*NAVY)
-        pdf.cell(0, 7, "주요 헤드라인", ln=True)
+        pdf.cell(180, 8, "  주요 헤드라인", ln=True, fill=True)
+        pdf.ln(1)
         pdf.set_font("Nanum", "", 9)
         pdf.set_text_color(*DARK)
         for line in headline_p.get_text(separator="\n", strip=True).split("\n"):
-            line = line.strip()
-            if line and "헤드라인" not in line:
+            line = _strip_emoji(line.strip())
+            if line and "헤드라인" not in line and len(line) > 2:
                 pdf.multi_cell(0, 6, line)
-        pdf.ln(3)
+                pdf.ln(1)
+        pdf.ln(2)
 
-    # ── 한 줄 코멘트 ──
-    comment = soup.find("div", style=lambda s: s and "border-left:4px solid #1e3a5f" in s if s else False)
+    # ── 코멘트 ──
+    comment = soup.find("div", style=lambda s: (
+        s and "border-left" in s and ("1e3a5f" in s or "f0f4f8" in s)
+    ) if s else False)
     if comment:
-        text = comment.get_text(separator=" ", strip=True)
-        text = text.replace("💬", "").replace("한 줄 코멘트", "").strip()
-        pdf.set_font("Nanum", "B", 10)
-        pdf.set_text_color(*NAVY)
+        pdf.set_font("Nanum", "B", 11)
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(3, 8, "", fill=True)
         pdf.set_fill_color(*BG)
-        pdf.cell(0, 7, "💬 한 줄 코멘트", ln=True, fill=True)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(180, 8, "  한 줄 코멘트", ln=True, fill=True)
+        pdf.ln(1)
+        text = _strip_emoji(comment.get_text(separator=" ", strip=True))
+        text = text.replace("한 줄 코멘트", "").strip()
+        pdf.set_fill_color(*BG)
         pdf.set_font("Nanum", "", 9)
         pdf.set_text_color(*DARK)
-        pdf.multi_cell(0, 6, text, fill=True)
+        pdf.multi_cell(0, 6.5, text, fill=True)
+        pdf.ln(2)
 
     # ── 푸터 ──
-    pdf.ln(6)
-    pdf.set_font("Nanum", "", 8)
+    pdf.set_draw_color(*GRAY)
+    pdf.set_line_width(0.3)
+    pdf.line(13, pdf.get_y(), 197, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_font("Nanum", "", 7.5)
     pdf.set_text_color(*GRAY)
-    pdf.multi_cell(0, 5, "본 브리핑은 공개된 금융 미디어 데이터를 기반으로 자동 작성되었습니다. 투자 판단의 근거로 단독 사용하지 마세요.")
+    pdf.multi_cell(0, 5,
+        "본 브리핑은 공개된 금융 미디어 데이터를 기반으로 자동 작성되었습니다. "
+        "투자 판단의 근거로 단독 사용하지 마세요.")
 
     return bytes(pdf.output())
 
@@ -273,7 +385,7 @@ def send_email(
         "Content-Type":  "application/json",
     }
 
-    resp = requests.post(SENDGRID_URL, json=payload, headers=headers, timeout=15)
+    resp = requests.post(SENDGRID_URL, json=payload, headers=headers, timeout=30)
 
     if resp.status_code not in (200, 202):
         raise RuntimeError(f"SendGrid API error {resp.status_code}: {resp.text}")
@@ -292,9 +404,11 @@ def main() -> None:
     print(
         f"[mail-mcp] Starting on {transport} "
         f"(bind {MCP_HOST}:{MCP_PORT})\n"
-        f"  SendGrid → {FROM_ADDRESS or '(unset)'}",
+        f"  SendGrid -> {FROM_ADDRESS or '(unset)'}",
         file=sys.stderr, flush=True,
     )
+    # 폰트 사전 로드 (백그라운드) — 첫 PDF 요청 시 지연 방지
+    threading.Thread(target=_warmup_fonts, daemon=True).start()
     mcp.run(transport=transport)
 
 
